@@ -57,6 +57,11 @@ fn calculate_checksum(path: &PathBuf) -> Result<String, io::Error> {
 }
 
 fn sync_file(path: PathBuf, config: &Config, metadata: &mut Metadata) {
+    if path.is_dir() {
+        info!("Skipping directory: {:?}", path);
+        return;
+    }
+
     info!("Syncing file: {:?}", path);
     let checksum = match calculate_checksum(&path) {
         Ok(checksum) => checksum,
