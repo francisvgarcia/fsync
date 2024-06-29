@@ -2,15 +2,16 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, Config as Notify
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use ssh2::Session;
+use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use chrono::Utc;
-use log::{info, warn, error};
+use log::{info, error};
 
 #[derive(Serialize, Deserialize)]
 struct Config {
@@ -39,7 +40,7 @@ fn load_config() -> Config {
 
 fn load_metadata() -> Metadata {
     let metadata_data = fs::read_to_string("metadata.json").unwrap_or_else(|_| "{\"synced_files\": []}".to_string());
-    serde_json::from_str(&metadata_data).expect("Unable to parse metadata file")
+    serde_json::from_str(&metadata_data).unwrap_or_else(|_| Metadata { synced_files: Vec::new() })
 }
 
 fn save_metadata(metadata: &Metadata) {
@@ -152,12 +153,42 @@ fn sync_file(path: PathBuf, config: &Config, metadata: &mut Metadata) {
     }
 }
 
+fn initial_scan(config: &Config, metadata: &mut Metadata) {
+    fn scan_directory(path: &PathBuf, config: &Config, metadata: &mut Metadata) {
+        if path.is_dir() {
+            // Process directory contents
+            match fs::read_dir(path) {
+                Ok(entries) => {
+                    for entry in entries {
+                        if let Ok(entry) = entry {
+                            let entry_path = entry.path();
+                            if entry_path.is_file() {
+                                sync_file(entry_path.clone(), config, metadata);
+                            }
+                            scan_directory(&entry_path, config, metadata);
+                        }
+                    }
+                },
+                Err(e) => error!("Failed to read directory {:?}: {:?}", path, e),
+            }
+        }
+    }
+
+    let source_path = PathBuf::from(&config.source_directory);
+    scan_directory(&source_path, config, metadata);
+}
+
 fn main() {
     env_logger::init();
     info!("Starting file sync service");
 
     let config = load_config();
     let mut metadata = load_metadata();
+    let mut last_processed = HashMap::new();
+    let debounce_duration = Duration::from_secs(2);
+
+    // Initial scan of the source directory
+    initial_scan(&config, &mut metadata);
 
     let (tx, rx) = channel();
     let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default()).unwrap();
@@ -167,10 +198,18 @@ fn main() {
 
     for event in rx {
         match event.unwrap() {
-            Event { kind: notify::EventKind::Create(_), paths, .. } | 
-            Event { kind: notify::EventKind::Modify(_), paths, .. } => {
+            Event { kind: notify::EventKind::Create(_) | notify::EventKind::Modify(_), paths, .. } => {
                 for path in paths {
-                    sync_file(path, &config, &mut metadata);
+                    let now = Instant::now();
+                    let should_process = match last_processed.get(&path) {
+                        Some(&last_time) => now.duration_since(last_time) > debounce_duration,
+                        None => true,
+                    };
+
+                    if should_process {
+                        sync_file(path.clone(), &config, &mut metadata);
+                        last_processed.insert(path, now);
+                    }
                 }
             },
             _ => {},
