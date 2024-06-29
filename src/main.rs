@@ -56,6 +56,10 @@ fn calculate_checksum(path: &PathBuf) -> Result<String, io::Error> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn is_already_synced(path: &PathBuf, checksum: &str, metadata: &Metadata) -> bool {
+    metadata.synced_files.iter().any(|f| f.path == path.to_str().unwrap() && f.checksum == checksum)
+}
+
 fn sync_file(path: PathBuf, config: &Config, metadata: &mut Metadata) {
     if path.is_dir() {
         info!("Skipping directory: {:?}", path);
@@ -71,7 +75,7 @@ fn sync_file(path: PathBuf, config: &Config, metadata: &mut Metadata) {
         }
     };
 
-    if metadata.synced_files.iter().any(|f| f.path == path.to_str().unwrap() && f.checksum == checksum) {
+    if is_already_synced(&path, &checksum, metadata) {
         info!("File already synced with the same content: {:?}", path);
         return; // File already synced with the same content
     }
