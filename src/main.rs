@@ -8,12 +8,14 @@ use std::fs::{File, read_dir};
 use std::io::{self, Read};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, Receiver};
+use std::thread;
 use std::time::{Duration, Instant};
 use chrono::Utc;
 use log::{info, warn, error};
+use simplelog::{CombinedLogger, ConfigBuilder, TermLogger, WriteLogger, LevelFilter, TerminalMode, ColorChoice};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Config {
     source_directory: String,
     remote_server: String,
@@ -21,14 +23,14 @@ struct Config {
     username: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct FileMetadata {
     path: String,
     checksum: Option<String>,
     last_synced: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Metadata {
     synced_files: Vec<FileMetadata>,
 }
@@ -40,7 +42,7 @@ fn load_config() -> Config {
 
 fn load_metadata() -> Metadata {
     let metadata_data = fs::read_to_string("metadata.json").unwrap_or_else(|_| "{\"synced_files\": []}".to_string());
-    serde_json::from_str(&metadata_data).expect("Unable to parse metadata file")
+    serde_json::from_str(&metadata_data).unwrap_or_else(|_| Metadata { synced_files: Vec::new() })
 }
 
 fn save_metadata(metadata: &Metadata) {
@@ -78,6 +80,7 @@ fn sync_path(path: PathBuf, config: &Config, metadata: &mut Metadata) {
             Ok(tcp) => tcp,
             Err(e) => {
                 error!("Failed to connect to remote server: {:?}", e);
+                warn!("Network issue: Unable to connect to remote server");
                 return;
             }
         };
@@ -85,6 +88,7 @@ fn sync_path(path: PathBuf, config: &Config, metadata: &mut Metadata) {
         sess.set_tcp_stream(tcp);
         if let Err(e) = sess.handshake() {
             error!("SSH handshake failed: {:?}", e);
+            warn!("Network issue: SSH handshake failed");
             return;
         }
 
@@ -153,6 +157,7 @@ fn sync_path(path: PathBuf, config: &Config, metadata: &mut Metadata) {
             Ok(tcp) => tcp,
             Err(e) => {
                 error!("Failed to connect to remote server: {:?}", e);
+                warn!("Network issue: Unable to connect to remote server");
                 return;
             }
         };
@@ -160,6 +165,7 @@ fn sync_path(path: PathBuf, config: &Config, metadata: &mut Metadata) {
         sess.set_tcp_stream(tcp);
         if let Err(e) = sess.handshake() {
             error!("SSH handshake failed: {:?}", e);
+            warn!("Network issue: SSH handshake failed");
             return;
         }
 
@@ -221,6 +227,57 @@ fn sync_path(path: PathBuf, config: &Config, metadata: &mut Metadata) {
     }
 }
 
+fn delete_remote_file(path: PathBuf, config: &Config, metadata: &mut Metadata) {
+    // Establish SSH connection
+    let tcp = match TcpStream::connect(format!("{}:22", config.remote_server)) {
+        Ok(tcp) => tcp,
+        Err(e) => {
+            error!("Failed to connect to remote server: {:?}", e);
+            warn!("Network issue: Unable to connect to remote server");
+            return;
+        }
+    };
+    let mut sess = Session::new().unwrap();
+    sess.set_tcp_stream(tcp);
+    if let Err(e) = sess.handshake() {
+        error!("SSH handshake failed: {:?}", e);
+        warn!("Network issue: SSH handshake failed");
+        return;
+    }
+
+    // Public key authentication
+    let home_dir = std::env::var("HOME").unwrap();
+    let private_key_path = format!("{}/.ssh/id_rsa", home_dir);
+    let public_key_path = format!("{}/.ssh/id_rsa.pub", home_dir);
+
+    if let Err(e) = sess.userauth_pubkey_file(
+        &config.username, 
+        Some(Path::new(&public_key_path)), 
+        Path::new(&private_key_path), 
+        None,
+    ) {
+        error!("SSH public key authentication failed: {:?}", e);
+        return;
+    }
+
+    if sess.authenticated() {
+        // Delete remote file
+        let remote_path = format!("{}/{}", config.remote_path, path.strip_prefix(&config.source_directory).unwrap().display());
+        let sftp = sess.sftp().unwrap();
+        match sftp.unlink(Path::new(&remote_path)) {
+            Ok(_) => {
+                info!("Remote file deleted successfully: {:?}", remote_path);
+                // Remove file metadata
+                metadata.synced_files.retain(|f| f.path != path.to_str().unwrap());
+                save_metadata(metadata);
+            },
+            Err(e) => error!("Failed to delete remote file: {:?}", e),
+        }
+    } else {
+        error!("Authentication failed");
+    }
+}
+
 fn initial_scan(config: &Config, metadata: &mut Metadata) {
     fn scan_directory(path: &PathBuf, config: &Config, metadata: &mut Metadata) {
         if path.is_dir() {
@@ -244,27 +301,13 @@ fn initial_scan(config: &Config, metadata: &mut Metadata) {
     scan_directory(&source_path, config, metadata);
 }
 
-fn main() {
-    env_logger::init();
-    info!("Starting file sync service");
-
-    let config = load_config();
-    let mut metadata = load_metadata();
+fn watch_directory(rx: Receiver<Result<Event, notify::Error>>, config: Config, mut metadata: Metadata) {
     let mut last_processed = HashMap::new();
     let debounce_duration = Duration::from_secs(2);
 
-    // Initial scan of the source directory
-    initial_scan(&config, &mut metadata);
-
-    let (tx, rx) = channel();
-    let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default()).unwrap();
-    watcher.watch(Path::new(&config.source_directory), RecursiveMode::Recursive).unwrap();
-
-    info!("Watching directory: {}", config.source_directory);
-
     for event in rx {
-        match event.unwrap() {
-            Event { kind: notify::EventKind::Create(_) | notify::EventKind::Modify(_), paths, .. } => {
+        match event {
+            Ok(Event { kind: notify::EventKind::Create(_) | notify::EventKind::Modify(_), paths, .. }) => {
                 for path in paths {
                     let now = Instant::now();
                     let should_process = match last_processed.get(&path) {
@@ -278,7 +321,49 @@ fn main() {
                     }
                 }
             },
-            _ => {},
+            Ok(Event { kind: notify::EventKind::Remove(_), paths, .. }) => {
+                for path in paths {
+                    delete_remote_file(path.clone(), &config, &mut metadata);
+                }
+            },
+            Ok(_) => {},
+            Err(e) => error!("Watch error: {:?}", e),
         }
+    }
+}
+
+fn main() {
+    // Initialize logging to both console and file
+    CombinedLogger::init(vec![
+        TermLogger::new(LevelFilter::Info, ConfigBuilder::new().set_time_to_local(true).build(), TerminalMode::Mixed, ColorChoice::Auto),
+        WriteLogger::new(LevelFilter::Info, ConfigBuilder::new().set_time_to_local(true).build(), File::create("fsync.log").unwrap()),
+    ]).unwrap();
+
+    info!("Starting file sync service");
+
+    let config = load_config();
+    let mut metadata = load_metadata();
+
+    // Initial scan of the source directory
+    initial_scan(&config, &mut metadata);
+
+    // Set up file system watcher
+    let (tx, rx) = channel();
+    let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default()).unwrap();
+    watcher.watch(Path::new(&config.source_directory), RecursiveMode::Recursive).unwrap();
+
+    info!("Watching directory: {}", config.source_directory);
+
+    // Start watching for changes in a separate thread
+    let config_clone = config.clone();
+    let metadata_clone = metadata.clone();
+    thread::spawn(move || {
+        watch_directory(rx, config_clone, metadata_clone);
+    });
+
+    // Periodically rescan the directory to ensure no files are missed
+    loop {
+        thread::sleep(Duration::from_secs(300)); // Rescan every 300 seconds
+        initial_scan(&config, &mut metadata);
     }
 }
