@@ -153,8 +153,8 @@ fn sync_file(path: PathBuf, config: &Config, metadata: &mut Metadata) {
     }
 }
 
-fn initial_scan(config: &Config, metadata: &mut Metadata) {
-    fn scan_directory(path: &PathBuf, config: &Config, metadata: &mut Metadata) {
+fn initial_scan(config: &Config, metadata: &mut Metadata, sync_remotely: bool) {
+    fn scan_directory(path: &PathBuf, config: &Config, metadata: &mut Metadata, sync_remotely: bool) {
         if path.is_dir() {
             // Process directory contents
             match fs::read_dir(path) {
@@ -163,9 +163,26 @@ fn initial_scan(config: &Config, metadata: &mut Metadata) {
                         if let Ok(entry) = entry {
                             let entry_path = entry.path();
                             if entry_path.is_file() {
-                                sync_file(entry_path.clone(), config, metadata);
+                                if sync_remotely {
+                                    sync_file(entry_path.clone(), config, metadata);
+                                } else {
+                                    // Just update metadata without syncing
+                                    let checksum = match calculate_checksum(&entry_path) {
+                                        Ok(checksum) => checksum,
+                                        Err(e) => {
+                                            error!("Failed to calculate checksum for {:?}: {:?}", entry_path, e);
+                                            continue;
+                                        }
+                                    };
+                                    let file_metadata = FileMetadata {
+                                        path: entry_path.to_str().unwrap().to_string(),
+                                        checksum,
+                                        last_synced: Utc::now().to_rfc3339(),
+                                    };
+                                    metadata.synced_files.push(file_metadata);
+                                }
                             }
-                            scan_directory(&entry_path, config, metadata);
+                            scan_directory(&entry_path, config, metadata, sync_remotely);
                         }
                     }
                 },
@@ -175,7 +192,7 @@ fn initial_scan(config: &Config, metadata: &mut Metadata) {
     }
 
     let source_path = PathBuf::from(&config.source_directory);
-    scan_directory(&source_path, config, metadata);
+    scan_directory(&source_path, config, metadata, sync_remotely);
 }
 
 fn main() {
@@ -187,8 +204,16 @@ fn main() {
     let mut last_processed = HashMap::new();
     let debounce_duration = Duration::from_secs(2);
 
+    // Check if metadata.json exists
+    let metadata_exists = Path::new("metadata.json").exists();
+
     // Initial scan of the source directory
-    initial_scan(&config, &mut metadata);
+    initial_scan(&config, &mut metadata, metadata_exists);
+
+    // Save metadata if it was populated initially
+    if !metadata_exists {
+        save_metadata(&metadata);
+    }
 
     let (tx, rx) = channel();
     let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default()).unwrap();

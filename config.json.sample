@@ -1,0 +1,6 @@
+{
+    "source_directory": "/home/it/source",
+    "remote_server": "remote.server.com",
+    "remote_path": "/var/destination",
+    "username": "remote-username"
+}
