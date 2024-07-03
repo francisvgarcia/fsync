@@ -61,7 +61,21 @@ fn is_already_synced(path: &PathBuf, checksum: &str, metadata: &Metadata) -> boo
     metadata.synced_files.iter().any(|f| f.path == path.to_str().unwrap() && f.checksum == checksum)
 }
 
+fn should_omit_file(path: &PathBuf) -> bool {
+    if let Some(file_name) = path.file_name() {
+        if let Some(file_name_str) = file_name.to_str() {
+            return file_name_str == ".DS_Store";
+        }
+    }
+    false
+}
+
 fn sync_file(path: PathBuf, config: &Config, metadata: &mut Metadata) {
+    if should_omit_file(&path) {
+        info!("Omitting file: {:?}", path);
+        return;
+    }
+
     if path.is_dir() {
         info!("Skipping directory: {:?}", path);
         return;
