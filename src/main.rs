@@ -1,19 +1,17 @@
 use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, Config as NotifyConfig};
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
 use ssh2::Session;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
-use std::io::{self, Read};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::channel;
+use std::sync::{mpsc::channel, Arc, Mutex};
 use std::time::{Duration, Instant};
-use chrono::Utc;
 use log::{info, error};
+use rayon::prelude::*;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Config {
     source_directory: String,
     remote_server: String,
@@ -22,15 +20,8 @@ struct Config {
 }
 
 #[derive(Serialize, Deserialize)]
-struct FileMetadata {
-    path: String,
-    checksum: String,
-    last_synced: String,
-}
-
-#[derive(Serialize, Deserialize)]
 struct Metadata {
-    synced_files: Vec<FileMetadata>,
+    synced_files: HashSet<String>,
 }
 
 fn load_config() -> Config {
@@ -40,25 +31,12 @@ fn load_config() -> Config {
 
 fn load_metadata() -> Metadata {
     let metadata_data = fs::read_to_string("metadata.json").unwrap_or_else(|_| "{\"synced_files\": []}".to_string());
-    serde_json::from_str(&metadata_data).unwrap_or_else(|_| Metadata { synced_files: Vec::new() })
+    serde_json::from_str(&metadata_data).unwrap_or_else(|_| Metadata { synced_files: HashSet::new() })
 }
 
 fn save_metadata(metadata: &Metadata) {
     let metadata_data = serde_json::to_string(metadata).expect("Unable to serialize metadata");
     fs::write("metadata.json", metadata_data).expect("Unable to write metadata file")
-}
-
-fn calculate_checksum(path: &PathBuf) -> Result<String, io::Error> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
-    hasher.update(buffer);
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn is_already_synced(path: &PathBuf, checksum: &str, metadata: &Metadata) -> bool {
-    metadata.synced_files.iter().any(|f| f.path == path.to_str().unwrap() && f.checksum == checksum)
 }
 
 fn should_omit_file(path: &PathBuf) -> bool {
@@ -70,7 +48,7 @@ fn should_omit_file(path: &PathBuf) -> bool {
     false
 }
 
-fn sync_file(path: PathBuf, config: &Config, metadata: &mut Metadata) {
+fn sync_file(path: PathBuf, config: &Config, metadata: &Arc<Mutex<Metadata>>) {
     if should_omit_file(&path) {
         info!("Omitting file: {:?}", path);
         return;
@@ -82,20 +60,7 @@ fn sync_file(path: PathBuf, config: &Config, metadata: &mut Metadata) {
     }
 
     info!("Syncing file: {:?}", path);
-    let checksum = match calculate_checksum(&path) {
-        Ok(checksum) => checksum,
-        Err(e) => {
-            error!("Failed to calculate checksum for {:?}: {:?}", path, e);
-            return;
-        }
-    };
 
-    if is_already_synced(&path, &checksum, metadata) {
-        info!("File already synced with the same content: {:?}", path);
-        return; // File already synced with the same content
-    }
-
-    // Establish SSH connection
     let tcp = match TcpStream::connect(format!("{}:22", config.remote_server)) {
         Ok(tcp) => tcp,
         Err(e) => {
@@ -110,7 +75,6 @@ fn sync_file(path: PathBuf, config: &Config, metadata: &mut Metadata) {
         return;
     }
 
-    // Public key authentication
     let home_dir = std::env::var("HOME").unwrap();
     let private_key_path = format!("{}/.ssh/id_rsa", home_dir);
     let public_key_path = format!("{}/.ssh/id_rsa.pub", home_dir);
@@ -126,7 +90,6 @@ fn sync_file(path: PathBuf, config: &Config, metadata: &mut Metadata) {
     }
 
     if sess.authenticated() {
-        // Use SCP to copy file
         let remote_path = format!("{}/{}", config.remote_path, path.file_name().unwrap().to_str().unwrap());
         let mut remote_file = match sess.scp_send(
             Path::new(&remote_path), 
@@ -153,52 +116,29 @@ fn sync_file(path: PathBuf, config: &Config, metadata: &mut Metadata) {
             return;
         }
 
-        // Update metadata
-        let file_metadata = FileMetadata {
-            path: path.to_str().unwrap().to_string(),
-            checksum,
-            last_synced: Utc::now().to_rfc3339(),
-        };
-        metadata.synced_files.push(file_metadata);
-        save_metadata(metadata);
+        let mut metadata = metadata.lock().unwrap();
+        metadata.synced_files.insert(path.to_str().unwrap().to_string());
+        save_metadata(&metadata);
         info!("File synced successfully: {:?}", path);
     } else {
         error!("Authentication failed");
     }
 }
 
-fn initial_scan(config: &Config, metadata: &mut Metadata, sync_remotely: bool) {
-    fn scan_directory(path: &PathBuf, config: &Config, metadata: &mut Metadata, sync_remotely: bool) {
+fn initial_scan(config: &Config, metadata: &Arc<Mutex<Metadata>>) {
+    fn scan_directory(path: &PathBuf, config: &Config, metadata: &Arc<Mutex<Metadata>>) {
         if path.is_dir() {
-            // Process directory contents
             match fs::read_dir(path) {
                 Ok(entries) => {
-                    for entry in entries {
-                        if let Ok(entry) = entry {
-                            let entry_path = entry.path();
-                            if entry_path.is_file() {
-                                if sync_remotely {
-                                    sync_file(entry_path.clone(), config, metadata);
-                                } else {
-                                    // Just update metadata without syncing
-                                    let checksum = match calculate_checksum(&entry_path) {
-                                        Ok(checksum) => checksum,
-                                        Err(e) => {
-                                            error!("Failed to calculate checksum for {:?}: {:?}", entry_path, e);
-                                            continue;
-                                        }
-                                    };
-                                    let file_metadata = FileMetadata {
-                                        path: entry_path.to_str().unwrap().to_string(),
-                                        checksum,
-                                        last_synced: Utc::now().to_rfc3339(),
-                                    };
-                                    metadata.synced_files.push(file_metadata);
-                                }
-                            }
-                            scan_directory(&entry_path, config, metadata, sync_remotely);
+                    let entries: Vec<_> = entries.filter_map(Result::ok).collect();
+                    entries.par_iter().for_each(|entry| {
+                        let entry_path = entry.path();
+                        if entry_path.is_file() {
+                            let mut metadata = metadata.lock().unwrap();
+                            metadata.synced_files.insert(entry_path.to_str().unwrap().to_string());
                         }
-                    }
+                        scan_directory(&entry_path, config, metadata);
+                    });
                 },
                 Err(e) => error!("Failed to read directory {:?}: {:?}", path, e),
             }
@@ -206,7 +146,7 @@ fn initial_scan(config: &Config, metadata: &mut Metadata, sync_remotely: bool) {
     }
 
     let source_path = PathBuf::from(&config.source_directory);
-    scan_directory(&source_path, config, metadata, sync_remotely);
+    scan_directory(&source_path, config, metadata);
 }
 
 fn main() {
@@ -214,19 +154,15 @@ fn main() {
     info!("Starting file sync service");
 
     let config = load_config();
-    let mut metadata = load_metadata();
+    let metadata = Arc::new(Mutex::new(load_metadata()));
     let mut last_processed = HashMap::new();
     let debounce_duration = Duration::from_secs(2);
 
-    // Check if metadata.json exists
     let metadata_exists = Path::new("metadata.json").exists();
 
-    // Initial scan of the source directory
-    initial_scan(&config, &mut metadata, metadata_exists);
-
-    // Save metadata if it was populated initially
     if !metadata_exists {
-        save_metadata(&metadata);
+        initial_scan(&config, &metadata);
+        save_metadata(&metadata.lock().unwrap());
     }
 
     let (tx, rx) = channel();
@@ -246,7 +182,12 @@ fn main() {
                     };
 
                     if should_process {
-                        sync_file(path.clone(), &config, &mut metadata);
+                        let config = config.clone();
+                        let metadata = Arc::clone(&metadata);
+                        let path_clone = path.clone();  // Clone the path before moving
+                        rayon::spawn(move || {
+                            sync_file(path_clone, &config, &metadata);
+                        });
                         last_processed.insert(path, now);
                     }
                 }

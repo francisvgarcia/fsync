@@ -1,4 +1,5 @@
-target/
+target/*
+build/*
 ./config.json
 ./fsync.log
 ./metadata.json
