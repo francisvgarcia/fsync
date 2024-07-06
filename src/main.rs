@@ -1,7 +1,7 @@
 use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, Config as NotifyConfig};
 use serde::{Deserialize, Serialize};
 use ssh2::Session;
-use std::collections::{HashMap};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::net::TcpStream;
@@ -10,7 +10,7 @@ use std::sync::{mpsc::channel, Arc, Mutex};
 use std::time::{Duration, Instant};
 use log::{info, error};
 use rayon::prelude::*;
-use std::io::Write;
+use std::io;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Config {
@@ -22,7 +22,7 @@ struct Config {
 
 #[derive(Serialize, Deserialize)]
 struct Metadata {
-    synced_files: Vec<String>,
+    synced_files: HashSet<String>,
 }
 
 fn load_config() -> Config {
@@ -32,7 +32,7 @@ fn load_config() -> Config {
 
 fn load_metadata() -> Metadata {
     let metadata_data = fs::read_to_string("metadata.json").unwrap_or_else(|_| "{\"synced_files\": []}".to_string());
-    serde_json::from_str(&metadata_data).unwrap_or_else(|_| Metadata { synced_files: Vec::new() })
+    serde_json::from_str(&metadata_data).unwrap_or_else(|_| Metadata { synced_files: HashSet::new() })
 }
 
 fn save_metadata(metadata: &Metadata) {
@@ -126,7 +126,7 @@ fn sync_file(path: PathBuf, config: &Config, metadata: &Arc<Mutex<Metadata>>) {
         }
 
         let mut metadata = metadata.lock().unwrap();
-        metadata.synced_files.push(path.to_str().unwrap().to_string());
+        metadata.synced_files.insert(path.to_str().unwrap().to_string());
         save_metadata(&metadata);
         info!("File synced successfully: {:?}", path);
     } else {
@@ -144,7 +144,7 @@ fn initial_scan(config: &Config, metadata: &Arc<Mutex<Metadata>>) {
                         let entry_path = entry.path();
                         if entry_path.is_file() {
                             let mut metadata = metadata.lock().unwrap();
-                            metadata.synced_files.push(entry_path.to_str().unwrap().to_string());
+                            metadata.synced_files.insert(entry_path.to_str().unwrap().to_string());
                         }
                         scan_directory(&entry_path, metadata);
                     });
@@ -166,6 +166,7 @@ fn main() {
     let metadata = Arc::new(Mutex::new(load_metadata()));
     let mut last_processed = HashMap::new();
     let debounce_duration = Duration::from_secs(2);
+    let initial_scan_complete = Arc::new(Mutex::new(false));
 
     let metadata_exists = Path::new("metadata.json").exists();
 
@@ -174,15 +175,48 @@ fn main() {
         save_metadata(&metadata.lock().unwrap());
     }
 
+    // Mark initial scan as complete
+    *initial_scan_complete.lock().unwrap() = true;
+
     let (tx, rx) = channel();
-    let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default()).unwrap();
-    watcher.watch(Path::new(&config.source_directory), RecursiveMode::Recursive).unwrap();
+    let watcher_result = RecommendedWatcher::new(tx, NotifyConfig::default());
+    let mut watcher = match watcher_result {
+        Ok(watcher) => watcher,
+        Err(e) => {
+            error!("Failed to create file watcher: {:?}", e);
+            return;
+        }
+    };
+
+    fn watch_directory(watcher: &mut RecommendedWatcher, path: &Path) -> Result<(), notify::Error> {
+        match watcher.watch(path, RecursiveMode::Recursive) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if let notify::ErrorKind::Io(ref io_err) = e.kind {
+                    if io_err.kind() == io::ErrorKind::PermissionDenied {
+                        error!("Permission denied: {:?}", path);
+                        return Ok(()); // Ignore this directory
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    if let Err(e) = watch_directory(&mut watcher, Path::new(&config.source_directory)) {
+        error!("Failed to watch directory {}: {:?}", config.source_directory, e);
+        return;
+    }
 
     info!("Watching directory: {}", config.source_directory);
 
     for event in rx {
-        match event.unwrap() {
-            Event { kind: notify::EventKind::Create(_) | notify::EventKind::Modify(_), paths, .. } => {
+        match event {
+            Ok(Event { kind: notify::EventKind::Create(_) | notify::EventKind::Modify(_), paths, .. }) => {
+                if !*initial_scan_complete.lock().unwrap() {
+                    continue;
+                }
+
                 for path in paths {
                     let now = Instant::now();
                     let should_process = match last_processed.get(&path) {
@@ -206,6 +240,7 @@ fn main() {
                     }
                 }
             },
+            Err(e) => error!("Watch error: {:?}", e),
             _ => {},
         }
     }
