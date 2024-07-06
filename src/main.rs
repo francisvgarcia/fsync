@@ -203,7 +203,32 @@ fn main() {
         }
     }
 
-    if let Err(e) = watch_directory(&mut watcher, Path::new(&config.source_directory)) {
+    fn resolve_symlinks(path: &PathBuf) -> Vec<PathBuf> {
+        let mut paths = vec![path.clone()];
+        if let Ok(target) = fs::read_link(path) {
+            if target.is_dir() {
+                paths.push(target);
+            }
+        }
+        paths
+    }
+
+    fn watch_recursive(watcher: &mut RecommendedWatcher, path: &Path) -> Result<(), notify::Error> {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                watch_directory(watcher, &entry_path)?;
+                let resolved_paths = resolve_symlinks(&entry_path);
+                for resolved_path in resolved_paths {
+                    watch_recursive(watcher, &resolved_path)?;
+                }
+            }
+        }
+        watch_directory(watcher, path)
+    }
+
+    if let Err(e) = watch_recursive(&mut watcher, Path::new(&config.source_directory)) {
         error!("Failed to watch directory {}: {:?}", config.source_directory, e);
         return;
     }
