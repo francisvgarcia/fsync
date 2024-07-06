@@ -1,7 +1,7 @@
 use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, Config as NotifyConfig};
 use serde::{Deserialize, Serialize};
 use ssh2::Session;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::fs;
 use std::fs::File;
 use std::net::TcpStream;
@@ -10,6 +10,7 @@ use std::sync::{mpsc::channel, Arc, Mutex};
 use std::time::{Duration, Instant};
 use log::{info, error};
 use rayon::prelude::*;
+use std::io::Write;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Config {
@@ -21,7 +22,7 @@ struct Config {
 
 #[derive(Serialize, Deserialize)]
 struct Metadata {
-    synced_files: HashSet<String>,
+    synced_files: Vec<String>,
 }
 
 fn load_config() -> Config {
@@ -31,7 +32,7 @@ fn load_config() -> Config {
 
 fn load_metadata() -> Metadata {
     let metadata_data = fs::read_to_string("metadata.json").unwrap_or_else(|_| "{\"synced_files\": []}".to_string());
-    serde_json::from_str(&metadata_data).unwrap_or_else(|_| Metadata { synced_files: HashSet::new() })
+    serde_json::from_str(&metadata_data).unwrap_or_else(|_| Metadata { synced_files: Vec::new() })
 }
 
 fn save_metadata(metadata: &Metadata) {
@@ -91,10 +92,18 @@ fn sync_file(path: PathBuf, config: &Config, metadata: &Arc<Mutex<Metadata>>) {
 
     if sess.authenticated() {
         let remote_path = format!("{}/{}", config.remote_path, path.file_name().unwrap().to_str().unwrap());
+        let file_metadata = match path.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                error!("Failed to get file metadata: {:?}", e);
+                return;
+            }
+        };
+
         let mut remote_file = match sess.scp_send(
             Path::new(&remote_path), 
             0o644, 
-            path.metadata().unwrap().len(), 
+            file_metadata.len(), 
             None
         ) {
             Ok(file) => file,
@@ -117,7 +126,7 @@ fn sync_file(path: PathBuf, config: &Config, metadata: &Arc<Mutex<Metadata>>) {
         }
 
         let mut metadata = metadata.lock().unwrap();
-        metadata.synced_files.insert(path.to_str().unwrap().to_string());
+        metadata.synced_files.push(path.to_str().unwrap().to_string());
         save_metadata(&metadata);
         info!("File synced successfully: {:?}", path);
     } else {
@@ -126,7 +135,7 @@ fn sync_file(path: PathBuf, config: &Config, metadata: &Arc<Mutex<Metadata>>) {
 }
 
 fn initial_scan(config: &Config, metadata: &Arc<Mutex<Metadata>>) {
-    fn scan_directory(path: &PathBuf, config: &Config, metadata: &Arc<Mutex<Metadata>>) {
+    fn scan_directory(path: &PathBuf, metadata: &Arc<Mutex<Metadata>>) {
         if path.is_dir() {
             match fs::read_dir(path) {
                 Ok(entries) => {
@@ -135,9 +144,9 @@ fn initial_scan(config: &Config, metadata: &Arc<Mutex<Metadata>>) {
                         let entry_path = entry.path();
                         if entry_path.is_file() {
                             let mut metadata = metadata.lock().unwrap();
-                            metadata.synced_files.insert(entry_path.to_str().unwrap().to_string());
+                            metadata.synced_files.push(entry_path.to_str().unwrap().to_string());
                         }
-                        scan_directory(&entry_path, config, metadata);
+                        scan_directory(&entry_path, metadata);
                     });
                 },
                 Err(e) => error!("Failed to read directory {:?}: {:?}", path, e),
@@ -146,7 +155,7 @@ fn initial_scan(config: &Config, metadata: &Arc<Mutex<Metadata>>) {
     }
 
     let source_path = PathBuf::from(&config.source_directory);
-    scan_directory(&source_path, config, metadata);
+    scan_directory(&source_path, metadata);
 }
 
 fn main() {
@@ -184,11 +193,16 @@ fn main() {
                     if should_process {
                         let config = config.clone();
                         let metadata = Arc::clone(&metadata);
-                        let path_clone = path.clone();  // Clone the path before moving
-                        rayon::spawn(move || {
-                            sync_file(path_clone, &config, &metadata);
-                        });
-                        last_processed.insert(path, now);
+                        let path_clone = path.clone();
+                        let metadata_guard = metadata.lock().unwrap();
+
+                        if !metadata_guard.synced_files.contains(&path_clone.to_str().unwrap().to_string()) {
+                            drop(metadata_guard); // Drop the guard before spawning a thread
+                            rayon::spawn(move || {
+                                sync_file(path_clone, &config, &metadata);
+                            });
+                            last_processed.insert(path, now);
+                        }
                     }
                 }
             },
